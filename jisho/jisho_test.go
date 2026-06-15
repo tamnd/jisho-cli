@@ -38,7 +38,7 @@ func sampleEntry() map[string]interface{} {
 		"senses": []map[string]interface{}{
 			{
 				"english_definitions": []string{"Hello", "Good day"},
-				"parts_of_speech":    []string{"Interjection"},
+				"parts_of_speech":     []string{"Interjection"},
 			},
 		},
 	}
