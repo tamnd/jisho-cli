@@ -1,0 +1,10 @@
+title       = "jisho"
+baseURL     = "https://jisho-cli.tamnd.com/"
+description = "A command line for jisho."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/jisho-cli"
