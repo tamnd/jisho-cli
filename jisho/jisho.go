@@ -1,38 +1,58 @@
 // Package jisho is the library behind the jisho command line:
-// the HTTP client, request shaping, and the typed data models for jisho.
+// the HTTP client, request shaping, and the typed data models for the
+// Jisho Japanese dictionary (jisho.org).
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
 // transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
 package jisho
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
-	"regexp"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to jisho. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "jisho/dev (+https://github.com/tamnd/jisho-cli)"
+// Host is the site this client talks to.
+const Host = "jisho.org"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at jisho.com; change it once you
-// know the real endpoints you want to read.
-const Host = "jisho.com"
+// BaseURL is the API root every request is built from.
+const BaseURL = "https://jisho.org/api/v1"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// DefaultUserAgent identifies the client to jisho.
+const DefaultUserAgent = "jisho-cli/0.1 (tamnd87@gmail.com)"
 
-// Client talks to jisho over HTTP.
+// Config holds all tunable parameters for the client.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
+}
+
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		Rate:      1100 * time.Millisecond,
+		Timeout:   15 * time.Second,
+		Retries:   3,
+		UserAgent: DefaultUserAgent,
+	}
+}
+
+// Client talks to jisho.org over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,21 +60,21 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: cfg.UserAgent,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
 // Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// to the client's settings.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +84,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,12 +93,12 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -123,78 +143,121 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on jisho.com. It is a stand-in for the typed records you
-// will model from the real jisho endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `jisho cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- Wire types (raw API response) ---
+
+type apiResponse struct {
+	Meta struct {
+		Status int `json:"status"`
+	} `json:"meta"`
+	Data []apiEntry `json:"data"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+type apiEntry struct {
+	Slug     string   `json:"slug"`
+	IsCommon bool     `json:"is_common"`
+	Tags     []string `json:"tags"`
+	JLPT     []string `json:"jlpt"`
+	Japanese []struct {
+		Word    string `json:"word"`
+		Reading string `json:"reading"`
+	} `json:"japanese"`
+	Senses []struct {
+		EnglishDefinitions []string `json:"english_definitions"`
+		PartsOfSpeech      []string `json:"parts_of_speech"`
+	} `json:"senses"`
+}
+
+// --- Output types ---
+
+// Word is the canonical output record for a single dictionary entry.
+type Word struct {
+	Slug          string   `json:"slug" kit:"id"`
+	Word          string   `json:"word"`
+	Reading       string   `json:"reading"`
+	IsCommon      bool     `json:"is_common"`
+	JLPT          []string `json:"jlpt"`
+	Tags          []string `json:"tags"`
+	Definitions   []string `json:"definitions"`
+	PartsOfSpeech []string `json:"parts_of_speech"`
+}
+
+// toWord converts a raw API entry into a Word.
+func toWord(e apiEntry) *Word {
+	w := &Word{
+		Slug:     e.Slug,
+		IsCommon: e.IsCommon,
+		JLPT:     e.JLPT,
+		Tags:     e.Tags,
+	}
+	if len(e.Japanese) > 0 {
+		w.Word = e.Japanese[0].Word
+		w.Reading = e.Japanese[0].Reading
+	}
+	for _, s := range e.Senses {
+		w.Definitions = append(w.Definitions, s.EnglishDefinitions...)
+		w.PartsOfSpeech = append(w.PartsOfSpeech, s.PartsOfSpeech...)
+	}
+	return w
+}
+
+// --- Client methods ---
+
+// buildQuery assembles the Jisho keyword string from optional modifiers.
+func buildQuery(q string, common bool, jlpt string) string {
+	var parts []string
+	if common {
+		parts = append(parts, "#common")
+	}
+	if jlpt != "" {
+		parts = append(parts, "#jlpt-"+jlpt)
+	}
+	parts = append(parts, q)
+	return strings.Join(parts, " ")
+}
+
+// SearchWords searches for words matching the given query.
+func (c *Client) SearchWords(ctx context.Context, query string, page int) ([]*Word, error) {
+	base := c.BaseURL
+	if base == "" {
+		base = BaseURL
+	}
+	u := base + "/search/words?keyword=" + url.QueryEscape(query)
+	if page > 1 {
+		u += fmt.Sprintf("&page=%d", page)
+	}
+	body, err := c.Get(ctx, u)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+	var resp apiResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	out := make([]*Word, 0, len(resp.Data))
+	for _, e := range resp.Data {
+		out = append(out, toWord(e))
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+// LookupKanji looks up a kanji character using the #kanji tag.
+func (c *Client) LookupKanji(ctx context.Context, char string) ([]*Word, error) {
+	query := "#kanji " + char
+	return c.SearchWords(ctx, query, 0)
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
+// randomWords is a small built-in vocabulary list for the random command.
+var randomWords = []string{
+	"love", "water", "mountain", "flower", "river", "sky", "dream",
+	"heart", "spring", "autumn", "wind", "fire", "earth", "music",
+	"light", "night", "morning", "rain", "snow", "bird", "tree",
+	"book", "time", "friend", "smile", "hope", "peace", "star",
+	"moon", "sun", "way", "life", "world", "voice", "color",
+}
+
+// RandomWord fetches a random vocabulary word.
+func (c *Client) RandomWord(ctx context.Context) ([]*Word, error) {
+	word := randomWords[rand.Intn(len(randomWords))]
+	query := "#common " + word
+	return c.SearchWords(ctx, query, 0)
 }

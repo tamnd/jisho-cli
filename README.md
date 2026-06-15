@@ -1,8 +1,8 @@
 # jisho
 
-A command line for jisho.
+A command line for the Jisho Japanese dictionary.
 
-`jisho` is a single pure-Go binary. It reads public jisho data
+`jisho` is a single pure-Go binary. It reads public Jisho data (jisho.org)
 over plain HTTPS, shapes it into clean records, and prints output that pipes
 into the rest of your tools. No API key, nothing to run alongside it.
 
@@ -26,10 +26,13 @@ docker run --rm ghcr.io/tamnd/jisho:latest --help
 ## Usage
 
 ```bash
-jisho page <path>                      # fetch one page as a record
-jisho page <path> -o json              # as JSON, ready for jq
-jisho page <path> --template '{{.Body}}'  # just the readable body text
-jisho links <path>                     # the pages it links to, one per line
+jisho search hello                     # search by English or Japanese
+jisho search 日本語 -o json            # as JSON, ready for jq
+jisho search hello --common            # common words only
+jisho search hello --jlpt n5           # JLPT N5 level only
+jisho search hello --page 2            # second page of results
+jisho kanji 日                         # look up a kanji character
+jisho random                           # a random vocabulary word
 jisho --help                           # the whole command tree
 ```
 
@@ -37,11 +40,6 @@ Every command shares one output contract: `-o table|json|jsonl|csv|tsv|url|raw`,
 `--fields` to pick columns, `--template` for a custom line, and `-n` to limit.
 The default adapts to where output goes (a table on a terminal, JSONL in a
 pipe), so the same command reads well by hand and parses cleanly downstream.
-
-This is a fresh scaffold. It ships one example resource type, `page`, wired end
-to end. Model the real jisho records in `jisho/` and declare their
-operations in `jisho/domain.go`; each one becomes a command, an HTTP
-route, and an MCP tool at once.
 
 ## Serve it
 
